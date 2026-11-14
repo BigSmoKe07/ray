@@ -1025,6 +1025,7 @@ _kv_router_panels = [
         ],
         fill=0,
         stack=False,
+        grid_pos=GridPos(0, 128, 12, 8),
     ),
 ]
 
