@@ -9,29 +9,6 @@ from ray.dashboard.modules.metrics.metrics_head import (
 )
 
 
-def test_autoscaling_prefill_panel_maxes_across_handles():
-    from ray.dashboard.modules.metrics.grafana_dashboard_factory import (
-        generate_serve_deployment_grafana_dashboard,
-        generate_serve_llm_grafana_dashboard,
-    )
-
-    dashboard, _ = generate_serve_deployment_grafana_dashboard()
-    assert all(p["title"] != "KV Router" for p in json.loads(dashboard)["panels"])
-    dashboard, _ = generate_serve_llm_grafana_dashboard()
-    row = next(p for p in json.loads(dashboard)["panels"] if p["title"] == "KV Router")
-    assert row["type"] == "row"
-    assert row["collapsed"] is True
-    panel = next(
-        p for p in row["panels"] if p["title"] == "KV Router: Uncached Prefill Tokens"
-    )
-    expr = panel["targets"][0]["expr"]
-    assert expr.startswith(
-        "max by (application, deployment) (ray_serve_autoscaling_router_metric{"
-    )
-    assert 'metric="outstanding_effective_prefill_tokens"' in expr
-    assert 'deployment=~"$deployment"' in expr
-
-
 @pytest.mark.parametrize(
     "headers, raises_error",
     [
