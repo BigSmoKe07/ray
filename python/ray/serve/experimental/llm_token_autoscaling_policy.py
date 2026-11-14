@@ -39,6 +39,7 @@ class LLMTokenAutoscalingPolicy:
                 return max(1, ctx.target_num_replicas), {}
             return ctx.target_num_replicas, {}
 
+        # The KV Router dashboard panel mirrors this max; update it if this changes.
         prefill_tokens = max(0, max(prefill_tokens_by_handle.values()))
         required_replicas = math.ceil(
             prefill_tokens / self._target_prefill_tokens_per_replica
