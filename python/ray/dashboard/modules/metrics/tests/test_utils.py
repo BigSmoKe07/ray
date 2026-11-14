@@ -22,7 +22,7 @@ def test_autoscaling_prefill_panel_maxes_across_handles():
     assert row["type"] == "row"
     assert row["collapsed"] is True
     panel = next(
-        p for p in row["panels"] if p["title"] == "Autoscaling uncached prefill tokens"
+        p for p in row["panels"] if p["title"] == "KV Router: Uncached Prefill Tokens"
     )
     expr = panel["targets"][0]["expr"]
     assert expr.startswith(

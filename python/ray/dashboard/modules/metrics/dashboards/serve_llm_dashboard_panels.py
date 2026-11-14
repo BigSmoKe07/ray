@@ -1014,8 +1014,8 @@ _token_distribution_panels = [
 _kv_router_panels = [
     Panel(
         id=61,
-        title="Autoscaling uncached prefill tokens",
-        description="Uncached prefill tokens the token autoscaling policy scales on: each router's mean over the look-back window, maxed across routers.",
+        title="KV Router: Uncached Prefill Tokens",
+        description="Mean uncached prefill tokens over the look-back window, used by token-based autoscaling.",
         unit="tokens",
         targets=[
             Target(
