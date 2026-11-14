@@ -1607,7 +1607,8 @@ def test_last_decision_total_num_requests_reuses_decision_value():
 
 
 def test_records_aggregated_router_metrics_per_handle():
-    st = DeploymentAutoscalingState(DeploymentID("D", "app"))
+    """record_autoscaling_metrics sets one router metric series per handle."""
+    st = DeploymentAutoscalingState(DeploymentID("D", "default"))
     st.register(
         DeploymentInfo(
             deployment_config=DeploymentConfig(
@@ -1629,7 +1630,7 @@ def test_records_aggregated_router_metrics_per_handle():
         policy_scope="deployment",
         aggregated_router_metrics={"tokens": {"h1": 300.0, "h2": 200.0}},
     )
-    tags = {"deployment": "D", "application": "app", "metric": "tokens"}
+    tags = {"deployment": "D", "application": "default", "metric": "tokens"}
     assert st.autoscaling_router_metric_gauge.set.call_args_list == [
         call(300.0, tags={**tags, "handle": "h1"}),
         call(200.0, tags={**tags, "handle": "h2"}),
