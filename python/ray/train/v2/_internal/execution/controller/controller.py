@@ -820,6 +820,10 @@ class TrainController:
             logger.warning(
                 "Restarting the worker group to diagnose: %s", decision.reason
             )
+            # TODO: Carry only the checks that require idle workers. The others
+            # diagnose this attempt, so running them on the next one captures
+            # the new workers instead, such as the NCCL hang detector's
+            # diagnostics of a confirmed hang merged into this Diagnose.
             self._health_callback.run_at_next_start(decision.checks)
             return TrainControllerLoopIterationResult(
                 run_attempt_id=self._get_run_attempt_id(),
