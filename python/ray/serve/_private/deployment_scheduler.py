@@ -4,8 +4,8 @@ import time
 import uuid
 import warnings
 from abc import ABC, abstractmethod
-from collections import defaultdict
-from dataclasses import dataclass
+from collections import Counter, defaultdict
+from dataclasses import dataclass, field
 from enum import Enum
 from functools import total_ordering
 from typing import (
@@ -47,6 +47,7 @@ from ray.serve._private.scheduling_rules import (
     ExcludeNodesConstraint,
     SchedulingConstraint,
     SchedulingContext,
+    rule_tiers,
 )
 from ray.serve._private.usage import ServeUsageTag
 from ray.util import metrics as ray_metrics
@@ -326,6 +327,8 @@ class DeploymentSchedulingInfo:
     is_gang: bool = False
     # Replicas are pinned to specific nodes, so they can't be moved.
     pins_replicas: bool = False
+    # The deployment's own placement rules, in precedence order.
+    rules: Tuple[SchedulingConstraint, ...] = ()
 
     @property
     def required_resources(self) -> RequestedResources:
@@ -486,6 +489,12 @@ class ClusterView:
     node_labels: Dict[str, Dict[str, str]]
     available_resources: Dict[str, AvailableNodeResources]
     node_to_assigned_replicas: Dict[str, Set[ReplicaID]]
+    total_resources: Dict[str, AvailableNodeResources] = field(default_factory=dict)
+    # Each deployment's replicas on each active node: running ones, and
+    # launching ones that already have a target node.
+    replicas_per_node: DefaultDict[DeploymentID, "Counter[str]"] = field(
+        default_factory=lambda: defaultdict(Counter)
+    )
 
     def take(
         self, node_id: str, resources: RequestedResources, replica_id: ReplicaID
@@ -495,6 +504,7 @@ class ClusterView:
                 self.available_resources[node_id] - resources
             )
         self.node_to_assigned_replicas.setdefault(node_id, set()).add(replica_id)
+        self.replicas_per_node[replica_id.deployment_id][node_id] += 1
 
 
 class NodeScorer(ABC):
@@ -514,6 +524,7 @@ class NodeScorer(ABC):
         required_resources: RequestedResources,
         candidates: Dict[str, AvailableNodeResources],
         node_to_assigned_replicas: Dict[str, Set[ReplicaID]],
+        ctx: SchedulingContext,
     ) -> Optional[str]:
         """Returns the chosen node, or None if no candidate fits."""
         raise NotImplementedError
@@ -531,6 +542,7 @@ class PackNodeScorer(NodeScorer):
         required_resources: RequestedResources,
         candidates: Dict[str, AvailableNodeResources],
         node_to_assigned_replicas: Dict[str, Set[ReplicaID]],
+        ctx: SchedulingContext,
     ) -> Optional[str]:
         non_idle_nodes = {
             node_id: resources
@@ -548,7 +560,12 @@ class PackNodeScorer(NodeScorer):
 
 
 class SpreadNodeScorer(NodeScorer):
-    """Leaves every placement to Ray Core's SPREAD strategy."""
+    """The node with the fewest replicas of the deployment, then the most room.
+
+    Ray Core's SPREAD strategy places replicas with no placement rules, since
+    its view of free resources is live while Serve's is cached. Serve only
+    picks a node for a replica whose deployment has rules.
+    """
 
     default_scheduling_strategy = "SPREAD"
     picks_nodes = False
@@ -558,8 +575,25 @@ class SpreadNodeScorer(NodeScorer):
         required_resources: RequestedResources,
         candidates: Dict[str, AvailableNodeResources],
         node_to_assigned_replicas: Dict[str, Set[ReplicaID]],
+        ctx: SchedulingContext,
     ) -> Optional[str]:
-        return None
+        chosen_node = None
+        chosen_count = 0
+        chosen_room: Optional[Resources] = None
+        for node_id in sorted(candidates):
+            available = candidates[node_id]
+            if not available.can_fit(required_resources):
+                continue
+            count = ctx.replicas_per_node.get(node_id, 0)
+            room = available - required_resources
+            # Nodes are visited in id order, so a full tie keeps the lowest id.
+            if (
+                chosen_room is None
+                or count < chosen_count
+                or (count == chosen_count and room > chosen_room)
+            ):
+                chosen_node, chosen_count, chosen_room = node_id, count, room
+        return chosen_node
 
 
 class DeploymentScheduler:
@@ -1204,6 +1238,86 @@ class DeploymentScheduler:
             # Seeded with running replicas, so that nodes taken in this update
             # are treated as non-idle by the replicas placed after them.
             node_to_assigned_replicas=self._get_node_to_running_replicas(),
+            total_resources={
+                node_id: AvailableNodeResources(resources)
+                for node_id, resources in (
+                    self._cluster_node_info_cache.get_total_resources_per_node().items()
+                )
+                if node_id in active_nodes
+            },
+            replicas_per_node=self._get_replicas_per_node(active_nodes),
+        )
+
+    def _get_replicas_per_node(
+        self, active_nodes: Set[str]
+    ) -> DefaultDict[DeploymentID, "Counter[str]"]:
+        """Each deployment's running and targeted launching replicas per node."""
+        replicas_per_node: DefaultDict[DeploymentID, Counter[str]] = defaultdict(
+            Counter
+        )
+        for deployment_id, replica_nodes in self._running_replicas.items():
+            for node_id in replica_nodes.values():
+                if node_id in active_nodes:
+                    replicas_per_node[deployment_id][node_id] += 1
+        for deployment_id, launching_replicas in self._launching_replicas.items():
+            for info in launching_replicas.values():
+                target = info.target_node_id
+                if target is not None and target in active_nodes:
+                    replicas_per_node[deployment_id][target] += 1
+        self._leave_out_compacting_replicas(replicas_per_node)
+        return replicas_per_node
+
+    def _leave_out_compacting_replicas(
+        self, replicas_per_node: DefaultDict[DeploymentID, "Counter[str]"]
+    ) -> None:
+        """Takes replicas leaving the node being compacted out of the layout.
+
+        They keep running until their replacements do, but they no longer hold
+        a floor up, so each replacement spreads as if they were already gone.
+        """
+        if self._compacting_node is None:
+            return
+        node_id = self._compacting_node.target_node_id
+        for replica_id in self._compacting_node.cached_running_replicas_on_target_node:
+            counts = replicas_per_node[replica_id.deployment_id]
+            if counts[node_id] > 0:
+                counts[node_id] -= 1
+
+    def _num_replicas(self, deployment_id: DeploymentID) -> int:
+        return (
+            len(self._pending_replicas[deployment_id])
+            + len(self._launching_replicas[deployment_id])
+            + len(self._recovering_replicas[deployment_id])
+            + len(self._running_replicas[deployment_id])
+        )
+
+    def _context_for(
+        self,
+        deployment_id: DeploymentID,
+        placement_candidates: List[Tuple[RequestedResources, List[Dict[str, str]]]],
+        view: ClusterView,
+    ) -> SchedulingContext:
+        """The facts the rules need to judge one replica of the deployment."""
+        candidate_nodes = {
+            node_id
+            for node_id, total in view.total_resources.items()
+            if any(
+                total.can_fit(resources)
+                and all(
+                    node_labels_match_selector(
+                        view.node_labels.get(node_id, {}), labels
+                    )
+                    for labels in required_labels
+                )
+                for resources, required_labels in placement_candidates
+            )
+        }
+        return SchedulingContext(
+            deployment_id=deployment_id,
+            node_labels=view.node_labels,
+            replicas_per_node=view.replicas_per_node[deployment_id],
+            num_replicas=self._num_replicas(deployment_id),
+            candidate_nodes=candidate_nodes,
         )
 
     def _schedule_pending_replicas(self) -> None:
@@ -1281,33 +1395,25 @@ class DeploymentScheduler:
         Returns the node the replica was bound to, or None if Serve picked no
         node or the replica could not be launched.
         """
-        if not scorer.picks_nodes:
+        deployment_id = scheduling_request.replica_id.deployment_id
+        rules = self._rules_for(deployment_id)
+        # Serve picks the node when the scorer always does, or when the
+        # deployment has rules of its own. Otherwise Ray Core places it.
+        if not (scorer.picks_nodes or self._deployments[deployment_id].rules):
             self._schedule_replica(
                 scheduling_request,
                 default_scheduling_strategy=scorer.default_scheduling_strategy,
             )
             return None
 
-        deployment_id = scheduling_request.replica_id.deployment_id
-        target_node = None
-        for (
-            required_resources,
-            required_labels,
-        ) in self._build_pack_placement_candidates(scheduling_request):
-            target_node = scorer.choose(
-                required_resources,
-                self._filter_candidate_nodes(
-                    view.available_resources,
-                    required_labels,
-                    self._rules_for(deployment_id),
-                    SchedulingContext(
-                        deployment_id=deployment_id, node_labels=view.node_labels
-                    ),
-                ),
-                view.node_to_assigned_replicas,
-            )
-            if target_node:
-                break
+        placement_candidates = self._build_pack_placement_candidates(scheduling_request)
+        target_node = self._select_node(
+            placement_candidates,
+            rules,
+            self._context_for(deployment_id, placement_candidates, view),
+            scorer,
+            view,
+        )
 
         replica_id = scheduling_request.replica_id
 
@@ -1336,10 +1442,10 @@ class DeploymentScheduler:
             if replica_id not in self._logged_pack_placement_failures:
                 self._logged_pack_placement_failures.add(replica_id)
                 logger.info(
-                    f"Pack scheduling could not place {replica_id} "
+                    f"Could not place {replica_id} "
                     f"({_format_resources_for_scheduling_log(scheduling_request.requested_resources)}): "
-                    f"no node with sufficient resources. "
-                    f"Falling back to default scheduling."
+                    f"no node with room passed the placement rules. "
+                    f"Falling back to {scorer.default_scheduling_strategy} scheduling."
                 )
 
         succeeded = self._schedule_replica(
@@ -1351,7 +1457,7 @@ class DeploymentScheduler:
         if succeeded and target_node is not None:
             self._logged_pack_placement_failures.discard(replica_id)
             logger.info(
-                f"Pack scheduled {replica_id} "
+                f"Scheduled {replica_id} "
                 f"({_format_resources_for_scheduling_log(scheduling_request.requested_resources)}) "
                 f"onto node {target_node}."
             )
@@ -1359,7 +1465,7 @@ class DeploymentScheduler:
             if replica_id not in self._logged_pack_placement_failures:
                 self._logged_pack_placement_failures.add(replica_id)
                 logger.info(
-                    f"Pack scheduling failed to launch {replica_id} "
+                    f"Failed to launch {replica_id} "
                     f"({_format_resources_for_scheduling_log(scheduling_request.requested_resources)}) "
                     f"on node {target_node}."
                 )
@@ -1521,11 +1627,64 @@ class DeploymentScheduler:
                 replicas_to_stop.update(replicas_by_gang_id[gang_id])
         else:
             # Single-replica scheduling: select individual replicas to stop
+            replicas_to_stop = self._choose_stops(
+                deployment_id, replicas_priority, max_num_to_stop
+            )
+
+        return replicas_to_stop
+
+    def _choose_stops(
+        self,
+        deployment_id: DeploymentID,
+        replicas_priority: List[ReplicaID],
+        max_num_to_stop: int,
+    ) -> Set[ReplicaID]:
+        """Picks replicas to stop in priority order, keeping the deployment's rules.
+
+        A stop a rule refuses is skipped. If that leaves fewer stops than
+        asked for, rules that aren't required are dropped, last listed first,
+        and the walk starts over.
+        """
+        rules = self._deployments[deployment_id].rules
+        node_by_replica = dict(self._running_replicas[deployment_id])
+        for replica_id, info in self._launching_replicas[deployment_id].items():
+            if info.target_node_id is not None:
+                node_by_replica[replica_id] = info.target_node_id
+        node_labels = {
+            node_id: self._cluster_node_info_cache.get_node_labels(node_id)
+            for node_id in self._cluster_node_info_cache.get_active_node_ids()
+        }
+        num_replicas_after = self._num_replicas(deployment_id) - max_num_to_stop
+
+        tiers = rule_tiers(rules)
+        for tier in tiers:
+            replicas_per_node = Counter(node_by_replica.values())
+            ctx = SchedulingContext(
+                deployment_id=deployment_id,
+                node_labels=node_labels,
+                replicas_per_node=replicas_per_node,
+                num_replicas=num_replicas_after,
+            )
+            replicas_to_stop: Set[ReplicaID] = set()
             for replica_id in replicas_priority:
-                replicas_to_stop.add(replica_id)
                 if len(replicas_to_stop) == max_num_to_stop:
                     break
+                node_id = node_by_replica.get(replica_id)
+                if node_id is not None:
+                    if not all(rule.may_stop(node_id, ctx) for rule in tier):
+                        continue
+                    replicas_per_node[node_id] -= 1
+                replicas_to_stop.add(replica_id)
+            if len(replicas_to_stop) == max_num_to_stop:
+                break
 
+        if tier != tiers[0]:
+            dropped = [rule.describe() for rule in tiers[0] if rule not in tier]
+            logger.info(
+                f"No set of {max_num_to_stop} replica(s) of {deployment_id} could "
+                f"stop while keeping every rule, so {dropped} gave way, last "
+                "listed first."
+            )
         return replicas_to_stop
 
     def _filter_nodes_by_label_selector(
@@ -1560,11 +1719,43 @@ class DeploymentScheduler:
             return set()
         return {self._compacting_node.target_node_id}
 
+    def _cluster_rules(self) -> Tuple[SchedulingConstraint, ...]:
+        """The rules that apply to every deployment."""
+        return (self._compaction_rule,)
+
     def _rules_for(
         self, deployment_id: DeploymentID
     ) -> Tuple[SchedulingConstraint, ...]:
-        """The rules every node picked for a replica of the deployment must pass."""
-        return (self._compaction_rule,)
+        """The deployment's own rules, then the rules for the whole cluster."""
+        return self._deployments[deployment_id].rules + self._cluster_rules()
+
+    def _select_node(
+        self,
+        placement_candidates: List[Tuple[RequestedResources, List[Dict[str, str]]]],
+        rules: Sequence[SchedulingConstraint],
+        ctx: SchedulingContext,
+        scorer: NodeScorer,
+        view: ClusterView,
+    ) -> Optional[str]:
+        """Picks a node under the strictest tier of rules that some node passes.
+
+        Within a tier, the replica's own label selector comes first, then each
+        of its fallbacks, so the rules decide before the replica's own
+        preferences do.
+        """
+        for tier in rule_tiers(rules):
+            for required_resources, required_labels in placement_candidates:
+                target_node = scorer.choose(
+                    required_resources,
+                    self._filter_candidate_nodes(
+                        view.available_resources, required_labels, tier, ctx
+                    ),
+                    view.node_to_assigned_replicas,
+                    ctx,
+                )
+                if target_node:
+                    return target_node
+        return None
 
     def _filter_candidate_nodes(
         self,
@@ -1800,6 +1991,43 @@ class DeploymentScheduler:
         )
         return target_node_id, float("inf")
 
+    def _simulate_move(
+        self, replica_id: ReplicaID, source_node_id: str, view: ClusterView
+    ) -> Optional[Tuple[str, RequestedResources]]:
+        """Where a replica leaving the source node would pack, and its resources.
+
+        The replica may only move to a node that keeps every rule its current
+        node holds, so compaction never trades a rule away for a cheaper node.
+        `view` must already leave the replica out of its deployment's layout.
+        Returns None if no such node has room.
+        """
+        deployment = self._deployments[replica_id.deployment_id]
+        placement_candidates = self._get_deployment_placement_candidates(deployment)
+        if placement_candidates is None:
+            return None
+
+        ctx = self._context_for(replica_id.deployment_id, placement_candidates, view)
+        held_rules = tuple(
+            rule
+            for rule in deployment.rules
+            if rule.allowed_nodes({source_node_id}, ctx)
+        )
+        for required_resources, required_labels in placement_candidates:
+            chosen_node = PackNodeScorer().choose(
+                required_resources,
+                self._filter_candidate_nodes(
+                    view.available_resources,
+                    required_labels,
+                    held_rules + self._cluster_rules(),
+                    ctx,
+                ),
+                view.node_to_assigned_replicas,
+                ctx,
+            )
+            if chosen_node:
+                return chosen_node, required_resources
+        return None
+
     def _find_best_node_to_compact(self) -> Optional[str]:
         node_to_running_replicas = self._get_node_to_running_replicas()
         available_resources_per_node = self._get_available_resources_per_node()
@@ -1809,10 +2037,19 @@ class DeploymentScheduler:
                 self._cluster_node_info_cache.get_total_resources_per_node().items()
             )
         }
+        active_nodes = self._cluster_node_info_cache.get_active_node_ids()
         all_node_labels = {
             node_id: self._cluster_node_info_cache.get_node_labels(node_id)
-            for node_id in self._cluster_node_info_cache.get_active_node_ids()
+            for node_id in active_nodes
         }
+        active_total_resources = {
+            node_id: AvailableNodeResources(resources)
+            for node_id, resources in (
+                self._cluster_node_info_cache.get_total_resources_per_node().items()
+            )
+            if node_id in active_nodes
+        }
+        replicas_per_node = self._get_replicas_per_node(active_nodes)
 
         best: Optional[Tuple[str, Dict[ReplicaID, str]]] = None
         for target_node_id in sorted(available_resources_per_node):
@@ -1833,42 +2070,30 @@ class DeploymentScheduler:
                 key=lambda r: self._deployments[r.deployment_id].required_resources,
                 reverse=True,
             )
-            node_to_simulated_replicas: DefaultDict[str, Set[ReplicaID]] = defaultdict(
-                set, {n: set(r) for n, r in node_to_running_replicas.items()}
+            view = ClusterView(
+                node_labels=all_node_labels,
+                available_resources=available_resources,
+                node_to_assigned_replicas=defaultdict(
+                    set, {n: set(r) for n, r in node_to_running_replicas.items()}
+                ),
+                total_resources=active_total_resources,
+                replicas_per_node=defaultdict(
+                    Counter,
+                    {d: Counter(c) for d, c in replicas_per_node.items()},
+                ),
             )
             assignment: Dict[ReplicaID, str] = {}
             for replica_id in replicas_on_target:
-                placement_candidates = self._get_deployment_placement_candidates(
-                    self._deployments[replica_id.deployment_id]
-                )
-                if placement_candidates is None:
+                # The replica is judged against the rest of its deployment.
+                view.replicas_per_node[replica_id.deployment_id][target_node_id] -= 1
+                placed = self._simulate_move(replica_id, target_node_id, view)
+                if placed is None:
                     assignment.clear()
                     break
 
-                chosen_node = None
-                for required_resources, required_labels in placement_candidates:
-                    chosen_node = PackNodeScorer().choose(
-                        required_resources,
-                        self._filter_candidate_nodes(
-                            available_resources,
-                            required_labels,
-                            self._rules_for(replica_id.deployment_id),
-                            SchedulingContext(
-                                deployment_id=replica_id.deployment_id,
-                                node_labels=all_node_labels,
-                            ),
-                        ),
-                        node_to_simulated_replicas,
-                    )
-                    if chosen_node:
-                        break
-                if not chosen_node:
-                    assignment.clear()
-                    break
-
+                chosen_node, required_resources = placed
                 assignment[replica_id] = chosen_node
-                available_resources[chosen_node] -= required_resources
-                node_to_simulated_replicas[chosen_node].add(replica_id)
+                view.take(chosen_node, required_resources, replica_id)
 
             if not assignment:
                 continue

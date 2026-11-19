@@ -25,6 +25,7 @@ from ray.serve._private.constants import (
 )
 from ray.serve._private.deployment_scheduler import (
     AvailableNodeResources,
+    CompactingNodeInfo,
     DeploymentDownscaleRequest,
     DeploymentSchedulingInfo,
     PackNodeScorer,
@@ -36,6 +37,11 @@ from ray.serve._private.deployment_scheduler import (
     _best_fit_node,
 )
 from ray.serve._private.deployment_state import DeploymentStateManager
+from ray.serve._private.scheduling_rules import (
+    RAY_NODE_ID_LABEL,
+    MinTopologyDomainsConstraint,
+    SchedulingConstraint,
+)
 from ray.serve._private.test_utils import (
     MockActorClass,
     MockClusterNodeInfoCache,
@@ -4045,6 +4051,312 @@ def test_compaction_ties_go_to_the_lowest_node_id(nodes):
     scheduler.on_replica_running(ReplicaID("f", filler_id), "node3")
 
     assert scheduler.get_node_to_compact(allow_new_compaction=True)[0] == "node1"
+
+
+ZONE = "ray.io/availability-zone"
+MARKET = "ray.io/market-type"
+
+
+def _hex(i: int) -> str:
+    """A valid node id. Ids sort in the order they are numbered."""
+    return f"{i:056x}"
+
+
+def _rules_scheduler(nodes, rules, num_cpus=1):
+    """A scheduler with one deployment that has `rules`, on `nodes`.
+
+    `nodes` maps a node id to (CPUs, labels).
+    """
+    d_id = DeploymentID(name="deployment1")
+    cache = MockClusterNodeInfoCache()
+    for node_id, (cpus, labels) in nodes.items():
+        cache.add_node(node_id, {"CPU": cpus}, labels)
+    scheduler = _compaction_scheduler(cache)
+    scheduler.on_deployment_created(d_id, SpreadDeploymentSchedulingPolicy())
+    scheduler.on_deployment_deployed(
+        d_id, rconfig(ray_actor_options={"num_cpus": num_cpus})
+    )
+    scheduler._deployments[d_id].rules = tuple(rules)
+    return scheduler, d_id
+
+
+def _place(scheduler, d_id, ids, num_cpus=1):
+    """Schedules one replica per id and returns each replica's target node."""
+    requests = [_request(ReplicaID(i, d_id), num_cpus) for i in ids]
+    scheduler.schedule(upscales={d_id: requests}, downscales={})
+    return {r.replica_id.unique_id: _target_node(r) for r in requests}
+
+
+class TestTopologyFloor:
+    def test_node_floor_spreads_before_packing(self):
+        """Pack would put both replicas on one node. A node floor of 2 doesn't."""
+        n1, n2 = _hex(1), _hex(2)
+        scheduler, d_id = _rules_scheduler(
+            {n1: (4, {}), n2: (4, {})},
+            [MinTopologyDomainsConstraint(RAY_NODE_ID_LABEL, 2)],
+        )
+        placed = _place(scheduler, d_id, ["r1", "r2", "r3"])
+        assert {placed["r1"], placed["r2"]} == {n1, n2}
+
+    def test_zone_floor_skips_covered_zones_and_unlabeled_nodes(self):
+        a1, a2, b1, u1 = _hex(1), _hex(2), _hex(3), _hex(4)
+        scheduler, d_id = _rules_scheduler(
+            {
+                a1: (1, {ZONE: "a"}),
+                a2: (1, {ZONE: "a"}),
+                b1: (1, {ZONE: "b"}),
+                # The roomiest node has no zone, so it can't raise the count.
+                u1: (8, {}),
+            },
+            [MinTopologyDomainsConstraint(ZONE, 2)],
+        )
+        scheduler.on_replica_running(ReplicaID("r0", d_id), a1)
+
+        assert _place(scheduler, d_id, ["r1"]) == {"r1": b1}
+
+    def test_floor_counts_replicas_placed_earlier_in_the_update(self):
+        a1, a2, b1 = _hex(1), _hex(2), _hex(3)
+        scheduler, d_id = _rules_scheduler(
+            {a1: (2, {ZONE: "a"}), a2: (2, {ZONE: "a"}), b1: (2, {ZONE: "b"})},
+            [MinTopologyDomainsConstraint(ZONE, 2)],
+        )
+        zones = {a1: "a", a2: "a", b1: "b"}
+        placed = _place(scheduler, d_id, ["r1", "r2"])
+        assert {zones[placed["r1"]], zones[placed["r2"]]} == {"a", "b"}
+
+    def test_floor_above_the_zones_there_are_doesnt_block(self):
+        a1, b1 = _hex(1), _hex(2)
+        scheduler, d_id = _rules_scheduler(
+            {a1: (2, {ZONE: "a"}), b1: (2, {ZONE: "b"})},
+            [MinTopologyDomainsConstraint(ZONE, 3)],
+        )
+        placed = _place(scheduler, d_id, ["r1", "r2", "r3"])
+        # Two zones exist, so the floor acts as two and the third replica packs.
+        assert {placed["r1"], placed["r2"]} == {a1, b1}
+        assert placed["r3"] in {a1, b1}
+
+    def test_a_full_new_zone_drops_the_floor(self):
+        """With no room in an uncovered zone, the replica goes where it fits."""
+        a1, b1 = _hex(1), _hex(2)
+        scheduler, d_id = _rules_scheduler(
+            {a1: (2, {ZONE: "a"}), b1: (0, {ZONE: "b"})},
+            [MinTopologyDomainsConstraint(ZONE, 2)],
+        )
+        scheduler.on_replica_running(ReplicaID("r0", d_id), a1)
+        assert _place(scheduler, d_id, ["r1"]) == {"r1": a1}
+
+    @pytest.mark.parametrize("zone_first", [True, False])
+    def test_earlier_rules_win(self, zone_first):
+        """The RFC's precedence example.
+
+        Replica 1 runs on a1 (zone a, spot). a2 (zone a, on demand) holds only
+        the market type floor, and b1 (zone b, spot) holds only the zone floor.
+        Replica 2 goes to b1 with the zone floor first, and to a2 otherwise.
+        """
+        a1, a2, b1 = _hex(1), _hex(2), _hex(3)
+        zone = MinTopologyDomainsConstraint(ZONE, 2)
+        market = MinTopologyDomainsConstraint(MARKET, 2)
+        scheduler, d_id = _rules_scheduler(
+            {
+                a1: (2, {ZONE: "a", MARKET: "spot"}),
+                a2: (2, {ZONE: "a", MARKET: "on-demand"}),
+                b1: (2, {ZONE: "b", MARKET: "spot"}),
+            },
+            [zone, market] if zone_first else [market, zone],
+        )
+        scheduler.on_replica_running(ReplicaID("r1", d_id), a1)
+
+        assert _place(scheduler, d_id, ["r2"]) == {"r2": b1 if zone_first else a2}
+
+
+@pytest.mark.skipif(
+    RAY_SERVE_USE_PACK_SCHEDULING_STRATEGY, reason="Needs spread strategy."
+)
+def test_spread_picks_the_node_with_the_fewest_replicas_once_floors_hold():
+    n1, n2, n3 = _hex(1), _hex(2), _hex(3)
+    scheduler, d_id = _rules_scheduler(
+        {n1: (8, {}), n2: (8, {}), n3: (4, {})},
+        [MinTopologyDomainsConstraint(RAY_NODE_ID_LABEL, 2)],
+    )
+    scheduler.on_replica_running(ReplicaID("r0", d_id), n1)
+    scheduler.on_replica_running(ReplicaID("r1", d_id), n2)
+
+    # The floor holds. n3 runs none of the deployment's replicas.
+    assert _place(scheduler, d_id, ["r2"]) == {"r2": n3}
+
+
+@pytest.mark.skipif(
+    RAY_SERVE_USE_PACK_SCHEDULING_STRATEGY, reason="Needs spread strategy."
+)
+def test_spread_leaves_deployments_without_rules_to_ray():
+    d_id = DeploymentID(name="deployment1")
+    cache = MockClusterNodeInfoCache()
+    cache.add_node(_hex(1), {"CPU": 2})
+    scheduler = _compaction_scheduler(cache)
+    scheduler.on_deployment_created(d_id, SpreadDeploymentSchedulingPolicy())
+    scheduler.on_deployment_deployed(d_id, rconfig(ray_actor_options={"num_cpus": 1}))
+
+    request = _request(ReplicaID("r1", d_id))
+    scheduler.schedule(upscales={d_id: [request]}, downscales={})
+    assert request.on_scheduled.call_args.args[0]._options["scheduling_strategy"] == (
+        "SPREAD"
+    )
+
+
+def _downscale(scheduler, d_id, num_to_stop):
+    return scheduler.schedule(
+        upscales={},
+        downscales={
+            d_id: DeploymentDownscaleRequest(
+                deployment_id=d_id, num_to_stop=num_to_stop
+            )
+        },
+    )[d_id]
+
+
+class TestDownscaleKeepsRules:
+    def test_keeps_the_last_replica_on_a_floor_node(self):
+        """Downscale would stop the lone replica on n2. The node floor keeps it."""
+        n1, n2 = _hex(1), _hex(2)
+        scheduler, d_id = _rules_scheduler(
+            {n1: (4, {}), n2: (4, {})},
+            [MinTopologyDomainsConstraint(RAY_NODE_ID_LABEL, 2)],
+        )
+        for i in range(3):
+            scheduler.on_replica_running(ReplicaID(f"on_n1_{i}", d_id), n1)
+        scheduler.on_replica_running(ReplicaID("on_n2", d_id), n2)
+
+        stopped = _downscale(scheduler, d_id, 1)
+        assert len(stopped) == 1
+        assert ReplicaID("on_n2", d_id) not in stopped
+
+    def test_floor_shrinks_with_the_replica_count(self):
+        n1, n2 = _hex(1), _hex(2)
+        scheduler, d_id = _rules_scheduler(
+            {n1: (4, {}), n2: (4, {})},
+            [MinTopologyDomainsConstraint(RAY_NODE_ID_LABEL, 2)],
+        )
+        scheduler.on_replica_running(ReplicaID("on_n1", d_id), n1)
+        scheduler.on_replica_running(ReplicaID("on_n2", d_id), n2)
+
+        # Scaling to one replica caps the floor at one node.
+        assert _downscale(scheduler, d_id, 1) == {ReplicaID("on_n1", d_id)}
+
+    def test_drops_later_rules_first_when_stuck(self):
+        class RefuseStopsOn(SchedulingConstraint):
+            def __init__(self, node_id):
+                self._node_id = node_id
+
+            def may_stop(self, node_id, ctx):
+                return node_id != self._node_id
+
+        n1, n2, n3 = _hex(1), _hex(2), _hex(3)
+        scheduler, d_id = _rules_scheduler(
+            {n1: (4, {}), n2: (4, {}), n3: (4, {})},
+            [RefuseStopsOn(n1), RefuseStopsOn(n2)],
+        )
+        for node_id in (n1, n2, n3):
+            scheduler.on_replica_running(ReplicaID(f"on_{node_id}", d_id), node_id)
+
+        # Both rules allow only n3. Dropping the second rule frees n2, and the
+        # first rule still keeps n1.
+        assert _downscale(scheduler, d_id, 2) == {
+            ReplicaID(f"on_{n2}", d_id),
+            ReplicaID(f"on_{n3}", d_id),
+        }
+
+    def test_replicas_without_a_node_stop_first(self):
+        n1, n2 = _hex(1), _hex(2)
+        scheduler, d_id = _rules_scheduler(
+            {n1: (4, {}), n2: (4, {})},
+            [MinTopologyDomainsConstraint(RAY_NODE_ID_LABEL, 2)],
+        )
+        scheduler.on_replica_running(ReplicaID("on_n1", d_id), n1)
+        scheduler.on_replica_running(ReplicaID("on_n2", d_id), n2)
+        scheduler.on_replica_recovering(ReplicaID("recovering", d_id))
+
+        assert _downscale(scheduler, d_id, 1) == {ReplicaID("recovering", d_id)}
+
+
+def _zone_compaction_scheduler(layout, rules):
+    """A pack scheduler for a deployment with `rules` and a CPU free filler.
+
+    `layout` maps a node id to (zone, replicas of the deployment, has filler).
+    Every node has 2 CPUs and each replica takes 1, so a node with one replica
+    has room for one more.
+    """
+    d_id = DeploymentID(name="deployment1")
+    filler_id = DeploymentID(name="filler")
+    cache = MockClusterNodeInfoCache()
+    for node_id, (zone, _, _) in layout.items():
+        cache.add_node(node_id, {"CPU": 2}, {ZONE: zone})
+    scheduler = _compaction_scheduler(cache)
+    for dep, cpus in ((d_id, 1), (filler_id, 0)):
+        scheduler.on_deployment_created(dep, SpreadDeploymentSchedulingPolicy())
+        scheduler.on_deployment_deployed(
+            dep, rconfig(ray_actor_options={"num_cpus": cpus})
+        )
+    scheduler._deployments[d_id].rules = tuple(rules)
+    for node_id, (_, replicas, has_filler) in layout.items():
+        for i in range(replicas):
+            scheduler.on_replica_running(ReplicaID(f"{node_id}_{i}", d_id), node_id)
+        if has_filler:
+            scheduler.on_replica_running(ReplicaID(node_id, filler_id), node_id)
+    return scheduler
+
+
+@pytest.mark.skipif(
+    not RAY_SERVE_USE_PACK_SCHEDULING_STRATEGY, reason="Needs pack strategy."
+)
+class TestCompactionKeepsRules:
+    def test_doesnt_empty_the_only_node_of_a_zone_the_floor_needs(self):
+        a1, b1 = _hex(1), _hex(2)
+        layout = {a1: ("a", 1, False), b1: ("b", 1, False)}
+
+        # Without the floor, either replica fits next to the other.
+        scheduler = _zone_compaction_scheduler(layout, [])
+        assert scheduler.get_node_to_compact(allow_new_compaction=True)[0] == a1
+
+        scheduler = _zone_compaction_scheduler(
+            layout, [MinTopologyDomainsConstraint(ZONE, 2)]
+        )
+        assert scheduler.get_node_to_compact(allow_new_compaction=True) is None
+
+    def test_moves_a_replica_within_the_zone_it_holds(self):
+        a1, a2, b1 = _hex(1), _hex(2), _hex(3)
+        scheduler = _zone_compaction_scheduler(
+            {a1: ("a", 1, False), a2: ("a", 0, True), b1: ("b", 1, False)},
+            [MinTopologyDomainsConstraint(ZONE, 2)],
+        )
+        # a1's replica can move to a2, which keeps zone a covered.
+        assert scheduler.get_node_to_compact(allow_new_compaction=True)[0] == a1
+
+    def test_replacement_keeps_the_zone_its_replica_leaves(self):
+        """B1 is compacted. r2's replacement must stay in zone b, not pack onto a1."""
+        a1, b1, b2 = _hex(1), _hex(2), _hex(3)
+        scheduler = _zone_compaction_scheduler(
+            {a1: ("a", 1, False), b1: ("b", 1, False), b2: ("b", 0, True)},
+            [MinTopologyDomainsConstraint(ZONE, 2)],
+        )
+        d_id = DeploymentID(name="deployment1")
+        leaving = ReplicaID(f"{b1}_0", d_id)
+        scheduler._compacting_node = CompactingNodeInfo(
+            target_node_id=b1,
+            start_timestamp_s=0,
+            cached_running_replicas_on_target_node={leaving},
+        )
+        replacement = _request(ReplicaID("replacement", d_id))
+        scheduler.schedule(upscales={d_id: [replacement]}, downscales={})
+        assert _target_node(replacement) == b2
+
+    def test_may_empty_a_zone_the_floor_doesnt_need(self):
+        a1, b1, c1 = _hex(1), _hex(2), _hex(3)
+        scheduler = _zone_compaction_scheduler(
+            {a1: ("a", 1, False), b1: ("b", 1, False), c1: ("c", 1, False)},
+            [MinTopologyDomainsConstraint(ZONE, 2)],
+        )
+        # Zones b and c still meet the floor after a1 is emptied.
+        assert scheduler.get_node_to_compact(allow_new_compaction=True)[0] == a1
 
 
 if __name__ == "__main__":
