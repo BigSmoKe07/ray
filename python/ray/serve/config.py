@@ -725,6 +725,51 @@ class BackpressureConfig(BaseModel):
     retry_after_s: Optional[NonNegativeFloat] = Field(default=None, allow_inf_nan=False)
 
 
+@PublicAPI(stability="alpha")
+class TopologySpread(BaseModel):
+    """A floor on how many domains of a node label a deployment's replicas cover.
+
+    A domain is the set of nodes that share one value of `label_key`. While a
+    deployment's replicas cover fewer domains than `min_domains`, the next
+    replica goes to a domain they don't cover yet. Once the floor holds, pack
+    or spread scheduling places the rest. Ray sets `ray.io/node-id` on every
+    node, so a floor on that key counts distinct nodes.
+
+    A deployment lists its rules in `topology_spread`, earliest first. When no
+    node with room holds every rule, the last listed rule gives way first.
+    A floor is best effort: it is capped at the replica count and at the
+    domains the replica could use, and it never holds a replica back.
+
+    Example:
+
+        .. code-block:: python
+
+            from ray import serve
+            from ray.serve.config import TopologySpread
+
+            @serve.deployment(
+                num_replicas=6,
+                topology_spread=[
+                    TopologySpread(
+                        label_key="ray.io/availability-zone", min_domains=2
+                    ),
+                    TopologySpread(label_key="ray.io/node-id", min_domains=3),
+                ],
+            )
+            class Ranker:
+                ...
+
+    Args:
+        label_key: The node label whose values are the domains.
+        min_domains: How many domains the replicas should cover.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    label_key: str = Field(min_length=1)
+    min_domains: int = Field(ge=1, strict=True)
+
+
 @PublicAPI(stability="stable")
 class AutoscalingConfig(BaseModel):
     """Config for the Serve Autoscaler.
