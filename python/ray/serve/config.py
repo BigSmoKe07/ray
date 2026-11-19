@@ -736,9 +736,16 @@ class TopologySpread(BaseModel):
     node, so a floor on that key counts distinct nodes.
 
     A deployment lists its rules in `topology_spread`, earliest first. When no
-    node with room holds every rule, the last listed rule gives way first.
-    A floor is best effort: it is capped at the replica count and at the
-    domains the replica could use, and it never holds a replica back.
+    node with room holds every rule, the last listed rule that isn't required
+    gives way first.
+
+    By default a floor is best effort: it is capped at the replica count and at
+    the domains the replica could use, and it never holds a replica back. A
+    required floor is only capped at the replica count. Until a node with room
+    joins a missing domain, as many replicas as there are missing domains wait,
+    and the rest place under the other rules. While it is unmet, Serve keeps a
+    request pending so the cluster autoscaler can add a node in a missing
+    domain.
 
     Example:
 
@@ -751,7 +758,10 @@ class TopologySpread(BaseModel):
                 num_replicas=6,
                 topology_spread=[
                     TopologySpread(
-                        label_key="ray.io/availability-zone", min_domains=2
+                        label_key="ray.io/availability-zone",
+                        min_domains=2,
+                        required=True,
+                        wait_timeout_s=600,
                     ),
                     TopologySpread(label_key="ray.io/node-id", min_domains=3),
                 ],
@@ -762,12 +772,26 @@ class TopologySpread(BaseModel):
     Args:
         label_key: The node label whose values are the domains.
         min_domains: How many domains the replicas should cover.
+        required: Whether replicas wait for a node that satisfies the rule
+            instead of being placed without it. A required rule's
+            `min_domains` can't exceed `num_replicas`, or `min_replicas` with
+            autoscaling.
+        wait_timeout_s: Only with `required`. How long a replica waits before
+            it is placed without the rule. None, the default, waits forever.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     label_key: str = Field(min_length=1)
     min_domains: int = Field(ge=1, strict=True)
+    required: bool = False
+    wait_timeout_s: Optional[PositiveFloat] = None
+
+    @model_validator(mode="after")
+    def _wait_timeout_needs_required(self):
+        if self.wait_timeout_s is not None and not self.required:
+            raise ValueError("wait_timeout_s can only be set with required=True.")
+        return self
 
 
 @PublicAPI(stability="stable")

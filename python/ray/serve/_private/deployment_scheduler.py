@@ -609,7 +609,12 @@ def _topology_rules(
     A floor of one domain always holds, so it adds no rule.
     """
     return tuple(
-        MinTopologyDomainsConstraint(rule["label_key"], rule["min_domains"])
+        MinTopologyDomainsConstraint(
+            rule["label_key"],
+            rule["min_domains"],
+            required=rule.get("required", False),
+            wait_timeout_s=rule.get("wait_timeout_s"),
+        )
         for rule in topology_spread or []
         if rule["min_domains"] > 1
     )
@@ -677,6 +682,9 @@ class DeploymentScheduler:
         # One pending probe per deployment whose required floor is unmet.
         self._create_domain_probe_fn = create_domain_probe_fn or DomainProbe
         self._probes: Dict[DeploymentID, Any] = {}
+        # Each deployment's topology rules that its replicas don't meet, as of
+        # the last update.
+        self._unmet_rules: Dict[DeploymentID, List[str]] = {}
 
         # Not checkpointed: a restarted controller reconciles first, then
         # re-detects compaction opportunities.
@@ -691,6 +699,24 @@ class DeploymentScheduler:
         self._num_compacted_nodes_counter = ray_metrics.Counter(
             "serve_num_compacted_nodes",
             description="The number of nodes that have been compacted.",
+        )
+        rule_tag_keys = ("deployment", "application", "rule")
+        self._covered_domains_gauge = ray_metrics.Gauge(
+            "serve_topology_spread_covered_domains",
+            description=(
+                "The domains a deployment's replicas cover, for each "
+                "topology_spread rule."
+            ),
+            tag_keys=rule_tag_keys,
+        )
+        self._floor_domains_gauge = ray_metrics.Gauge(
+            "serve_topology_spread_floor_domains",
+            description=(
+                "The domains each topology_spread rule asks for, capped at the "
+                "replica count and, for a best effort rule, at the domains "
+                "there are."
+            ),
+            tag_keys=rule_tag_keys,
         )
 
     def on_deployment_created(
@@ -778,6 +804,7 @@ class DeploymentScheduler:
 
         self._outdated_replicas.pop(deployment_id, None)
         self._held_replicas.pop(deployment_id, None)
+        self._unmet_rules.pop(deployment_id, None)
         self._stop_probe(deployment_id)
 
         del self._deployments[deployment_id]
@@ -1290,7 +1317,7 @@ class DeploymentScheduler:
             )
 
         self._schedule_pending_replicas()
-        self._update_probes()
+        self._update_rule_status()
 
         # Handle downscales
         deployment_to_replicas_to_stop = {}
@@ -1859,31 +1886,54 @@ class DeploymentScheduler:
         if probe is not None:
             probe.kill()
 
-    def _update_probes(self) -> None:
-        """Keeps one probe pending for each deployment whose required floor is unmet.
+    def get_unmet_rules(self, deployment_id: DeploymentID) -> List[str]:
+        """The deployment's topology rules its replicas don't meet, as of the
+        last update."""
+        return list(self._unmet_rules.get(deployment_id, []))
 
-        A probe asks for a replica's resources in a domain the floor lacks, so
-        the cluster autoscaler can launch a node there. Once it lands it is
+    def _update_rule_status(self) -> None:
+        """Records which topology rules each deployment meets, and keeps probes.
+
+        One probe stays pending for each deployment whose required floor is
+        unmet. It asks for a replica's resources in a domain the floor lacks,
+        so the cluster autoscaler can launch a node there. Once it lands it is
         removed, which leaves its room to a held replica in the next update.
         """
         view: Optional[ClusterView] = None
         for deployment_id in sorted(self._deployments, key=str):
             info = self._deployments[deployment_id]
-            required = [
+            floors = [
                 rule
                 for rule in info.rules
-                if isinstance(rule, MinTopologyDomainsConstraint) and rule.required
+                if isinstance(rule, MinTopologyDomainsConstraint)
             ]
             placement_candidates = (
-                self._get_deployment_placement_candidates(info) if required else None
+                self._get_deployment_placement_candidates(info) if floors else None
             )
-            if not required or placement_candidates is None:
+            if not floors or placement_candidates is None:
+                self._unmet_rules.pop(deployment_id, None)
                 self._stop_probe(deployment_id)
                 continue
 
             view = view or self._cluster_view()
             ctx = self._context_for(deployment_id, placement_candidates, view)
-            unmet = next((rule for rule in required if not rule.is_met(ctx)), None)
+            self._unmet_rules[deployment_id] = [
+                rule.describe() for rule in floors if not rule.is_met(ctx)
+            ]
+            for rule in floors:
+                tags = {
+                    "deployment": deployment_id.name,
+                    "application": deployment_id.app_name,
+                    "rule": rule.describe(),
+                }
+                self._covered_domains_gauge.set(
+                    len(rule.covered_domains(ctx)), tags=tags
+                )
+                self._floor_domains_gauge.set(rule.effective_floor(ctx), tags=tags)
+            unmet = next(
+                (rule for rule in floors if rule.required and not rule.is_met(ctx)),
+                None,
+            )
             probe = self._probes.get(deployment_id)
             if unmet is None:
                 if probe is not None:

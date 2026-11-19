@@ -739,6 +739,9 @@ class DeploymentStateUpdateResult:
 
 
 CHECKPOINT_KEY = "serve-deployment-state-checkpoint"
+# Starts the status message of a HEALTHY deployment with unmet topology rules.
+UNMET_RULES_MESSAGE_PREFIX = "Unmet placement rules: "
+
 SLOW_STARTUP_WARNING_S = int(
     os.environ.get(
         "RAY_SERVE_SLOW_STARTUP_WARNING_S",
@@ -4410,6 +4413,27 @@ class DeploymentState:
             self._in_transition = True
         return uncovered
 
+    def update_unmet_rules_message(self, unmet_rules: List[str]) -> None:
+        """Names unmet topology rules in the message of a HEALTHY deployment.
+
+        The status stays HEALTHY, since the replicas run. A best effort rule
+        is unmet when the cluster has no room in a missing domain, and a
+        required rule is unmet once it gave way after its wait timeout.
+        """
+        if self._curr_status_info.status != DeploymentStatus.HEALTHY:
+            return
+        current = self._curr_status_info.message
+        if current and not current.startswith(UNMET_RULES_MESSAGE_PREFIX):
+            # Don't hide a message something else set.
+            return
+        message = (
+            f"{UNMET_RULES_MESSAGE_PREFIX}{', '.join(unmet_rules)}."
+            if unmet_rules
+            else ""
+        )
+        if message != current:
+            self._curr_status_info = self._curr_status_info.update_message(message)
+
     def get_outdated_replica_ids(self) -> Set[ReplicaID]:
         """The replicas a rollout will stop, because their version needs a restart.
 
@@ -7625,6 +7649,10 @@ class DeploymentStateManager:
         )
         for deployment_id, replicas_to_stop in deployment_to_replicas_to_stop.items():
             self._deployment_states[deployment_id].stop_replicas(replicas_to_stop)
+        for deployment_id, deployment_state in self._deployment_states.items():
+            deployment_state.update_unmet_rules_message(
+                self._deployment_scheduler.get_unmet_rules(deployment_id)
+            )
         for deployment_id, scheduling_requests in upscales.items():
             self._handle_scheduling_request_failures(deployment_id, scheduling_requests)
 
