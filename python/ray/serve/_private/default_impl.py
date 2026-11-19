@@ -60,6 +60,12 @@ CreatePlacementGroupFn = Callable[[CreatePlacementGroupRequest], PlacementGroup]
 def _default_create_placement_group(
     request: CreatePlacementGroupRequest,
 ) -> PlacementGroup:
+    # Only passed when set, since only groups with topology rules use it.
+    fallback_options = (
+        {"fallback_strategy": request.fallback_strategy}
+        if request.fallback_strategy
+        else {}
+    )
     return ray.util.placement_group(
         request.bundles,
         request.strategy,
@@ -67,6 +73,7 @@ def _default_create_placement_group(
         name=request.name,
         lifetime="detached",
         bundle_label_selector=request.bundle_label_selector,
+        **fallback_options,
     )
 
 

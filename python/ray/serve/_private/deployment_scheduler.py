@@ -803,19 +803,14 @@ class DeploymentScheduler:
         """The deployment's `topology_spread`, or the cluster's default node floor.
 
         Setting `topology_spread`, even to an empty list, replaces the default.
-        Pinned replicas and placement groups that Serve can't steer to a node
-        never get the default, and gangs get no rules at all.
+        Pinned replicas never get the default, and gangs get no rules at all.
         """
         if info.is_gang:
             return None
         topology_spread = getattr(replica_config, "topology_spread", None)
         if topology_spread is not None:
             return topology_spread
-        steers_placement_group = (
-            replica_config.placement_group_bundles is None
-            or replica_config.placement_group_strategy == "STRICT_PACK"
-        )
-        if info.pins_replicas or not steers_placement_group:
+        if info.pins_replicas:
             return None
         return [
             {"label_key": RAY_NODE_ID_LABEL, "min_domains": RAY_SERVE_MIN_REPLICA_NODES}
@@ -1060,14 +1055,37 @@ class DeploymentScheduler:
                 if scheduling_request.placement_group_strategy
                 else "PACK"
             )
+            bundle_label_selector = (
+                scheduling_request.placement_group_bundle_label_selector
+            )
+            fallback_strategy = None
+            if label_selector_chain:
+                # The chain decides bundle 0. The other bundles keep theirs.
+                rest = list(
+                    (
+                        bundle_label_selector
+                        or [{}] * len(scheduling_request.placement_group_bundles)
+                    )[1:]
+                )
+                bundle_label_selector = [label_selector_chain[0]] + rest
+                fallback_strategy = [
+                    {"bundle_label_selector": [selector] + rest}
+                    for selector in label_selector_chain[1:]
+                ] or None
             try:
                 per_replica_pg = self._create_placement_group_fn(
                     CreatePlacementGroupRequest(
                         bundles=scheduling_request.placement_group_bundles,
                         strategy=placement_group_strategy,
-                        target_node_id=target_node_id,
+                        # Ray Core only honors a soft target for STRICT_PACK.
+                        target_node_id=(
+                            target_node_id
+                            if placement_group_strategy == "STRICT_PACK"
+                            else None
+                        ),
                         name=scheduling_request.actor_options["name"],
-                        bundle_label_selector=scheduling_request.placement_group_bundle_label_selector,
+                        bundle_label_selector=bundle_label_selector,
+                        fallback_strategy=fallback_strategy,
                     )
                 )
             except Exception:
@@ -1377,15 +1395,9 @@ class DeploymentScheduler:
         return deployment_to_replicas_to_stop
 
     def _use_pack_strategy(self) -> bool:
-        return RAY_SERVE_USE_PACK_SCHEDULING_STRATEGY and not any(
-            d.is_non_strict_pack_pg() for d in self._deployments.values()
-        )
+        return RAY_SERVE_USE_PACK_SCHEDULING_STRATEGY
 
     def _node_scorer(self) -> NodeScorer:
-        # Pack is only used if each deployment either uses the STRICT_PACK
-        # placement group strategy or no placement group at all. Ray Core only
-        # honors a soft target node for STRICT_PACK groups, so with any other
-        # group Serve's choice of node would be ignored.
         return PackNodeScorer() if self._use_pack_strategy() else SpreadNodeScorer()
 
     def _cluster_view(self) -> ClusterView:
@@ -1575,8 +1587,14 @@ class DeploymentScheduler:
             ].target_node_id
         rules = self._rules_for(deployment_id)
         # Serve picks the node when the scorer always does, or when the
-        # deployment has rules of its own. Otherwise Ray Core places it.
-        if not (scorer.picks_nodes or self._deployments[deployment_id].rules):
+        # deployment has rules of its own. Otherwise Ray Core places it. Ray
+        # Core only honors a target node for a STRICT_PACK placement group, so
+        # it places any other group itself.
+        info = self._deployments[deployment_id]
+        serve_picks = bool(info.rules) or (
+            scorer.picks_nodes and not info.is_non_strict_pack_pg()
+        )
+        if not serve_picks:
             self._schedule_replica(
                 scheduling_request,
                 default_scheduling_strategy=scorer.default_scheduling_strategy,
@@ -1636,7 +1654,7 @@ class DeploymentScheduler:
             default_scheduling_strategy=scorer.default_scheduling_strategy,
             target_node_id=target_node,
             label_selector_chain=self._label_selector_chain(
-                scheduling_request, rules, ctx
+                scheduling_request, rules, ctx, target_node
             ),
         )
 
@@ -1679,10 +1697,10 @@ class DeploymentScheduler:
                         scheduling_request.placement_group_bundle_label_selector
                     )
                 else:
-                    # TODO(ryanaoleary@): Support PACK strategy with bundle label selectors.
-                    raise NotImplementedError(
-                        "Placement Group strategy 'PACK' with bundle_label_selector "
-                        "is not yet supported in the Serve scheduler."
+                    # The node Serve picks hosts bundle 0, the replica actor's
+                    # bundle, so only its selector applies there.
+                    primary_labels = (
+                        scheduling_request.placement_group_bundle_label_selector[:1]
                     )
         else:
             # Actor: Use Actor label selector
@@ -2022,12 +2040,13 @@ class DeploymentScheduler:
                     self._stop_probe(deployment_id)
                 continue
 
+            own_selector = (
+                (info.bundle_label_selector or [{}])[0]
+                if info.placement_group_bundles is not None
+                else info.label_selector or {}
+            )
             selector = merge_selectors(
-                [
-                    info.label_selector or {},
-                    unmet.selector(ctx),
-                    self._compaction_rule.selector(ctx),
-                ]
+                [own_selector, unmet.selector(ctx), self._compaction_rule.selector(ctx)]
             )
             try:
                 self._probes[deployment_id] = self._create_domain_probe_fn(
@@ -2171,6 +2190,7 @@ class DeploymentScheduler:
         scheduling_request: ReplicaSchedulingRequest,
         rules: Sequence[SchedulingConstraint],
         ctx: SchedulingContext,
+        target_node: Optional[str] = None,
     ) -> Optional[List[Dict[str, str]]]:
         """The rules as label selectors for Ray Core, strictest first.
 
@@ -2178,23 +2198,39 @@ class DeploymentScheduler:
         then into each of its fallbacks, so Ray Core relaxes the rules the way
         Serve does. The last tier holds no rule that can be dropped, so Ray
         Core can always fall back to what the replica asked for itself.
+        For a placement group, the chain is for bundle 0, the replica actor's
+        bundle. Ray Core takes no target node for a group other than
+        STRICT_PACK, so the chain starts with the node Serve picked.
         Returns None when the deployment has no rules of its own, or for a
-        replica Serve can't steer this way: one in a placement group, or one
-        pinned to a node.
+        replica Serve can't steer this way: one in a gang, or one pinned to a
+        node.
         """
         if (
             not self._deployments[ctx.deployment_id].rules
-            or scheduling_request.placement_group_bundles is not None
             or scheduling_request.gang_placement_group is not None
             or scheduling_request.target_node_id is not None
         ):
             return None
-        options = scheduling_request.actor_options
-        own_selectors = [options.get("label_selector") or {}] + [
-            fallback.get("label_selector") or {}
-            for fallback in options.get("fallback_strategy") or []
-        ]
         chain: List[Dict[str, str]] = []
+        if scheduling_request.placement_group_bundles is not None:
+            own_selectors = [
+                (scheduling_request.placement_group_bundle_label_selector or [{}])[0]
+            ]
+            if (
+                target_node is not None
+                and scheduling_request.placement_group_strategy != "STRICT_PACK"
+            ):
+                chain.append(
+                    merge_selectors(
+                        [own_selectors[0], {RAY_NODE_ID_LABEL: f"in({target_node})"}]
+                    )
+                )
+        else:
+            options = scheduling_request.actor_options
+            own_selectors = [options.get("label_selector") or {}] + [
+                fallback.get("label_selector") or {}
+                for fallback in options.get("fallback_strategy") or []
+            ]
         for tier in rule_tiers(rules):
             tier_selector = merge_selectors(rule.selector(ctx) for rule in tier)
             for own_selector in own_selectors:
@@ -2436,7 +2472,12 @@ class DeploymentScheduler:
         replica id. Gangs and pinned replicas never move.
         """
         info = self._deployments[deployment_id]
-        if not info.rules or info.is_gang or info.pins_replicas:
+        if (
+            not info.rules
+            or info.is_gang
+            or info.pins_replicas
+            or info.is_non_strict_pack_pg()
+        ):
             return None
         placement_candidates = self._get_deployment_placement_candidates(info)
         if placement_candidates is None:
@@ -2513,7 +2554,7 @@ class DeploymentScheduler:
     def _get_deployment_placement_candidates(
         self, deployment: DeploymentSchedulingInfo
     ) -> Optional[List[Tuple[RequestedResources, List[Dict[str, str]]]]]:
-        if deployment.is_gang or deployment.is_non_strict_pack_pg():
+        if deployment.is_gang:
             return None
 
         actor_options: Dict[str, Any] = {}
@@ -2734,6 +2775,8 @@ class DeploymentScheduler:
         Returns None if no such node has room.
         """
         deployment = self._deployments[replica_id.deployment_id]
+        if deployment.is_non_strict_pack_pg():
+            return None
         placement_candidates = self._get_deployment_placement_candidates(deployment)
         if placement_candidates is None:
             return None

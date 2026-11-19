@@ -13,6 +13,34 @@ class MyDeployment:
 app = MyDeployment.bind()
 # __max_replicas_per_node_end__
 
+# __topology_spread_start__
+from ray import serve
+from ray.serve.config import TopologySpread
+
+
+@serve.deployment(
+    num_replicas=6,
+    ray_actor_options={"num_cpus": 0.1},
+    topology_spread=[
+        # Cover two zones. Replicas wait up to 10 minutes for a second zone.
+        TopologySpread(
+            label_key="ray.io/availability-zone",
+            min_domains=2,
+            required=True,
+            wait_timeout_s=600,
+        ),
+        # Then cover three nodes, if the cluster has room.
+        TopologySpread(label_key="ray.io/node-id", min_domains=3),
+    ],
+)
+class Ranker:
+    def __call__(self, request):
+        return "Hello!"
+
+
+ranker_app = Ranker.bind()
+# __topology_spread_end__
+
 # __placement_group_start__
 from ray import serve
 
