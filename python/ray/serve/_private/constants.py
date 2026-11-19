@@ -661,6 +661,10 @@ RAY_SERVE_COMPACTION_MAX_BACKOFF_TIME_S = get_env_float(
 # can't steer to a node are exempt.
 RAY_SERVE_MIN_REPLICA_NODES = get_env_int_positive("RAY_SERVE_MIN_REPLICA_NODES", 1)
 
+# Whether running replicas move toward their topology rules once their
+# deployment settles.
+RAY_SERVE_REBALANCE_RULES = get_env_bool("RAY_SERVE_REBALANCE_RULES", "1")
+
 # Comma-separated list of custom resources prioritized in scheduling. Sorted from highest to lowest priority.
 # Example: "customx,customy"
 RAY_SERVE_HIGH_PRIORITY_CUSTOM_RESOURCES: List[str] = str_to_list(
