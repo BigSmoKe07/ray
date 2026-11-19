@@ -10,6 +10,7 @@ from ray.serve._private.scheduling_rules import (
     SchedulingConstraint,
     SchedulingContext,
     label_value,
+    merge_selectors,
     rule_tiers,
 )
 
@@ -163,6 +164,63 @@ def test_floor_allows_stops_down_to_the_new_replica_count():
 
     # Scaling to one replica caps the floor at one zone.
     assert rule.may_stop("b1", ctx)
+
+
+def test_floor_selector_avoids_covered_domains_while_unmet():
+    rule = MinTopologyDomainsConstraint(ZONE, 2)
+
+    ctx = make_ctx(NODE_LABELS, num_replicas=2)
+    # Nothing is covered yet, so any node with a zone adds one.
+    assert rule.selector(ctx) == {ZONE: "exists()"}
+
+    ctx = make_ctx(NODE_LABELS, replicas_per_node={"a1": 1}, num_replicas=2)
+    assert rule.selector(ctx) == {ZONE: "exists(),!in(a)"}
+
+    ctx = make_ctx(NODE_LABELS, replicas_per_node={"a1": 1, "b1": 1}, num_replicas=2)
+    assert rule.selector(ctx) == {}
+
+
+def test_node_floor_selector_needs_no_exists():
+    rule = MinTopologyDomainsConstraint(RAY_NODE_ID_LABEL, 2)
+    assert rule.selector(make_ctx(NODE_LABELS, num_replicas=2)) == {}
+    ctx = make_ctx(NODE_LABELS, replicas_per_node={"a1": 1}, num_replicas=2)
+    assert rule.selector(ctx) == {RAY_NODE_ID_LABEL: "!in(a1)"}
+
+
+def test_exclude_nodes_selector():
+    assert ExcludeNodesConstraint(set).selector(make_ctx()) == {}
+    assert ExcludeNodesConstraint(lambda: {"n2", "n1"}).selector(make_ctx()) == {
+        RAY_NODE_ID_LABEL: "!in(n1,n2)"
+    }
+
+
+def test_merge_selectors_joins_expressions_on_a_key():
+    assert merge_selectors(
+        [{ZONE: "in(a,b,c)"}, {ZONE: "!in(a)", "gpu": "a100"}, {ZONE: "!in(a)"}]
+    ) == {ZONE: "in(a,b,c),!in(a)", "gpu": "a100"}
+    assert merge_selectors([]) == {}
+
+
+def test_required_floor_isnt_capped_at_the_domains_there_are():
+    best_effort = MinTopologyDomainsConstraint(ZONE, 3)
+    required = MinTopologyDomainsConstraint(ZONE, 3, required=True)
+    ctx = make_ctx(NODE_LABELS, replicas_per_node={"a1": 1, "b1": 1}, num_replicas=6)
+
+    # Only zones a and b exist.
+    assert best_effort.is_met(ctx)
+    assert not required.is_met(ctx)
+    assert required.missing_domains(ctx) == 1
+    # It's still capped at the replica count.
+    assert required.effective_floor(make_ctx(NODE_LABELS, num_replicas=2)) == 2
+    assert required.describe() == (
+        "required topology_spread[ray.io/availability-zone>=3]"
+    )
+
+
+def test_required_rules_stay_in_every_tier():
+    required = MinTopologyDomainsConstraint(ZONE, 2, required=True)
+    optional = MinTopologyDomainsConstraint(RAY_NODE_ID_LABEL, 3)
+    assert rule_tiers([required, optional]) == [(required, optional), (required,)]
 
 
 if __name__ == "__main__":
